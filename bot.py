@@ -12,6 +12,7 @@ from telegram.error import TelegramError
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 UNLOCK_DELAY = int(os.getenv("UNLOCK_DELAY", 10))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
 
 # Configure Logging
 logging.basicConfig(
@@ -32,6 +33,14 @@ def init_db():
                 message_id INTEGER,
                 unlock_time REAL,
                 PRIMARY KEY (user_id, chat_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
             """
         )
@@ -67,7 +76,16 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
         # But if it's an error like bot was blocked, sending might also fail. We'll proceed to try sending anyway.
     
     # 2. Send unprotected message
-    unprotected_text = "Thanks for the corporateion, now forward this message as you wish ."
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = 'unprotected'")
+        row = cursor.fetchone()
+        
+    if row:
+        unprotected_text = row[0]
+    else:
+        unprotected_text = "Thanks for the corporateion, now forward this message as you wish ."
+        
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -100,11 +118,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Send protected message
-    protected_text = (
-        "To forward this message tap this link-\n\n"
-        "https://t.me/sae_plays/3 (stay for 5 sec)\n\n"
-        "Then come back to this bot to forward this message as you wish ."
-    )
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = 'protected'")
+        row = cursor.fetchone()
+
+    if row:
+        protected_text = row[0]
+    else:
+        protected_text = (
+            "To forward this message tap this link-\n\n"
+            "https://t.me/sae_plays/3 (stay for 5 sec)\n\n"
+            "Then come back to this bot to forward this message as you wish ."
+        )
     
     try:
         sent_message = await context.bot.send_message(
@@ -138,6 +164,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info("Unlock timer started.")
     context.job_queue.run_once(unlock_task, UNLOCK_DELAY, data=job_data, name=f"unlock_{user.id}_{chat.id}")
+
+
+async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the protected message text."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = update.message.text.partition(' ')[2]
+    if not text:
+        await update.message.reply_text("Please provide the text. Example:\n/setprotected Hello World")
+        return
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('protected', ?)", (text,))
+        conn.commit()
+    await update.message.reply_text("Protected message updated successfully for today!")
+
+
+async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the unprotected message text."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = update.message.text.partition(' ')[2]
+    if not text:
+        await update.message.reply_text("Please provide the text. Example:\n/setunprotected Hello World")
+        return
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('unprotected', ?)", (text,))
+        conn.commit()
+    await update.message.reply_text("Unprotected message updated successfully for today!")
 
 
 def recover_jobs(application):
@@ -197,6 +255,8 @@ def main():
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("setprotected", set_protected))
+    application.add_handler(CommandHandler("setunprotected", set_unprotected))
 
     # Recover jobs right after app starts
     recover_jobs(application)

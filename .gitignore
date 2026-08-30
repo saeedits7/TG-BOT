@@ -11,3 +11,6 @@ bot_data.db
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Markdown files
+*.md
