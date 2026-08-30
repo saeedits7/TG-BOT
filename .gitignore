@@ -1,0 +1,13 @@
+# Environments
+.env
+venv/
+env/
+ENV/
+
+# Database
+bot_data.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
