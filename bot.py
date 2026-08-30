@@ -128,7 +128,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         protected_text = (
             "To forward this message tap this link-\n\n"
-            "https://t.me/sae_plays/3 (stay for 5 sec)\n\n"
+            "https://t.me/sae_plays/3 (wait for 5 to 10 seconds)\n\n"
             "Then come back to this bot to forward this message as you wish ."
         )
     
@@ -145,7 +145,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Calculate time and save to DB
     now = datetime.now().timestamp()
-    unlock_time = now + UNLOCK_DELAY
+    
+    # Fetch dynamic delay or use default
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = 'delay'")
+        row = cursor.fetchone()
+        
+    if row and row[0].isdigit():
+        current_delay = int(row[0])
+    else:
+        current_delay = UNLOCK_DELAY
+        
+    unlock_time = now + current_delay
 
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -163,7 +175,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     logger.info("Unlock timer started.")
-    context.job_queue.run_once(unlock_task, UNLOCK_DELAY, data=job_data, name=f"unlock_{user.id}_{chat.id}")
+    context.job_queue.run_once(unlock_task, current_delay, data=job_data, name=f"unlock_{user.id}_{chat.id}")
 
 
 async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,7 +191,7 @@ async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('protected', ?)", (text,))
         conn.commit()
-    await update.message.reply_text("Protected message updated successfully for today!")
+    await update.message.reply_text("Protected message updated successfully!")
 
 
 async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,8 +207,24 @@ async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('unprotected', ?)", (text,))
         conn.commit()
-    await update.message.reply_text("Unprotected message updated successfully for today!")
+    await update.message.reply_text("Unprotected message updated successfully!")
 
+async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to set the unlock delay timer."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    text = update.message.text.partition(' ')[2]
+    if not text or not text.isdigit():
+        await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 15")
+        return
+    
+    delay = int(text)
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
+        conn.commit()
+    await update.message.reply_text(f"Timer successfully updated to {delay} seconds!")
 
 def recover_jobs(application):
     """Recover pending jobs from the database after a restart."""
@@ -257,6 +285,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
+    application.add_handler(CommandHandler("settimer", set_timer))
 
     # Recover jobs right after app starts
     recover_jobs(application)
