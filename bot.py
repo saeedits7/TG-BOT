@@ -12,7 +12,7 @@ import asyncio
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-UNLOCK_DELAY = int(os.getenv("UNLOCK_DELAY", 10))
+UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 7.5))
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
 
 # Configure Logging
@@ -47,7 +47,7 @@ async def init_db():
         await conn.commit()
 
 async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
-    """The task that runs after 10 seconds to delete the protected message and send the unprotected one."""
+    """The task that runs after the delay to delete the protected message and send the unprotected one."""
     job = context.job
     user_id = job.data["user_id"]
     chat_id = job.data["chat_id"]
@@ -78,7 +78,7 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
     if row:
         unprotected_text = row[0]
     else:
-        unprotected_text = "Thanks for the corporateion, now forward this message as you wish ."
+        unprotected_text = "Thanks for the cooperation, now forward this message as you wish."
         
     try:
         await context.bot.send_message(
@@ -119,8 +119,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         protected_text = (
             "To forward this message tap this link-\n\n"
-            "https://t.me/sae_plays/3 (wait for 5 to 10 seconds)\n\n"
-            "Then come back to this bot to forward this message as you wish ."
+            "https://t.me/sae_plays/3 (stay for 5-10 sec)"
         )
     
     try:
@@ -142,8 +141,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with conn.execute("SELECT value FROM config WHERE key = 'delay'") as cursor:
             row = await cursor.fetchone()
         
-    if row and row[0].isdigit():
-        current_delay = int(row[0])
+    if row:
+        try:
+            current_delay = float(row[0])
+        except ValueError:
+            current_delay = UNLOCK_DELAY
     else:
         current_delay = UNLOCK_DELAY
         
@@ -200,11 +202,11 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id != ADMIN_ID:
         return
     text = update.message.text.partition(' ')[2]
-    if not text or not text.isdigit():
-        await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 15")
+    if not text or not text.replace('.', '', 1).isdigit():
+        await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 7.5")
         return
     
-    delay = int(text)
+    delay = float(text)
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
         await conn.commit()
@@ -269,6 +271,7 @@ def main():
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
     application.add_handler(CommandHandler("settimer", set_timer))
 
+    # We also pass drop_pending_updates=True so that old instances/conflicts don't replay old messages
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
