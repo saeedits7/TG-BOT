@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import TelegramError
 
 # Load environment variables
@@ -258,18 +258,50 @@ async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Protected message updated successfully!")
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to cancel any pending interactive operation like broadcast."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    if context.user_data.get("waiting_for_broadcast"):
+        context.user_data["waiting_for_broadcast"] = False
+        await update.message.reply_text("🚫 Broadcast operation cancelled.")
+    else:
+        await update.message.reply_text("No active operation to cancel.")
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to broadcast a message to all registered bot users."""
+    """Admin command to initiate interactive forward-broadcast."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
     
-    broadcast_text = update.message.text.partition(' ')[2]
-    if not broadcast_text:
-        await update.message.reply_text("Please provide text to broadcast. Example:\n/broadcast Hello everyone!")
+    # Enable waiting state for Admin
+    context.user_data["waiting_for_broadcast"] = True
+    await update.message.reply_text(
+        "📢 *Interactive Forward-Broadcast Initiated*\n\n"
+        "Please **send or forward** any message (text, photo, video, voice note, document, or channel post) that you want to broadcast to all registered bot users.\n\n"
+        "_Type /cancel at any time to abort._",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes any message sent or forwarded by Admin when waiting_for_broadcast is active."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
         return
 
-    status_msg = await update.message.reply_text("Starting broadcast...")
+    if not context.user_data.get("waiting_for_broadcast"):
+        return
+
+    # Clear waiting state
+    context.user_data["waiting_for_broadcast"] = False
+
+    admin_chat_id = update.effective_chat.id
+    admin_msg_id = update.message.message_id
+
+    status_msg = await update.message.reply_text("📤 Starting forward-broadcast to all users...")
     
     async with get_db() as conn:
         async with conn.execute("SELECT user_id FROM users") as cursor:
@@ -283,26 +315,31 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user_id = row[0]
         is_admin_target = (target_user_id == ADMIN_ID)
         try:
-            await context.bot.send_message(
+            await context.bot.forward_message(
                 chat_id=target_user_id,
-                text=broadcast_text,
+                from_chat_id=admin_chat_id,
+                message_id=admin_msg_id,
                 protect_content=not is_admin_target
             )
             successful += 1
             await asyncio.sleep(0.04)  # Rate limiting safety delay
         except TelegramError as e:
-            logger.warning(f"Broadcast failed for user {target_user_id}: {e}")
+            logger.warning(f"Broadcast forward failed for user {target_user_id}: {e}")
             failed += 1
 
     if successful > 0:
         asyncio.create_task(increment_stat("protected_sent", successful))
 
-    await status_msg.edit_text(
-        f"✅ Broadcast Completed!\n\n"
-        f"📊 Total Users: {total_users}\n"
-        f"🟢 Delivered: {successful}\n"
-        f"🔴 Failed/Blocked: {failed}"
-    )
+    try:
+        await status_msg.edit_text(
+            f"✅ *Forward Broadcast Completed!*\n\n"
+            f"📊 Total Users: {total_users}\n"
+            f"🟢 Delivered: {successful}\n"
+            f"🔴 Failed/Blocked: {failed}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to update broadcast status message: {e}")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,7 +432,9 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
 
     application.run_polling()
 
