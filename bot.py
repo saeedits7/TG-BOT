@@ -1,6 +1,5 @@
 import logging
 import os
-from aiohttp import web
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -185,24 +184,6 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Timer successfully updated to {config['delay']} seconds!")
 
 
-async def health_check(request):
-    return web.Response(text="Bot is running!")
-
-async def start_webserver():
-    """Starts a dummy web server so Render doesn't shut down the bot."""
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logger.info(f"Dummy web server started on port {port}")
-
-async def post_init(application):
-    """Run this after the bot initializes."""
-    await start_webserver()
-
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN is missing. Please check your .env file.")
@@ -210,15 +191,28 @@ def main():
 
     logger.info("Bot starting...")
 
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
     application.add_handler(CommandHandler("settimer", set_timer))
 
-    # We pass drop_pending_updates=True so that old instances/conflicts don't replay old messages
-    application.run_polling(drop_pending_updates=True)
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+    if WEBHOOK_URL:
+        PORT = int(os.getenv("PORT", 10000))
+        logger.info(f"Starting webhook on port {PORT} with URL {WEBHOOK_URL}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL,
+            drop_pending_updates=True
+        )
+    else:
+        logger.info("No WEBHOOK_URL found. Starting long polling...")
+        # We pass drop_pending_updates=True so that old instances/conflicts don't replay old messages
+        application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
