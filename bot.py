@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, AIORateLimiter
 from telegram.error import TelegramError
 
 # Load environment variables
@@ -191,7 +191,7 @@ def main():
 
     logger.info("Bot starting...")
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
@@ -207,7 +207,8 @@ def main():
             listen="0.0.0.0",
             port=PORT,
             webhook_url=WEBHOOK_URL,
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            max_connections=100
         )
     else:
         logger.info("No WEBHOOK_URL found. Starting long polling...")
