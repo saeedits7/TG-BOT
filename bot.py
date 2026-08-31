@@ -105,7 +105,6 @@ async def init_db():
             )
             """
         )
-        await conn.execute("DELETE FROM users WHERE user_id = ?", (ADMIN_ID,))
         await conn.commit()
 
 async def increment_stat(key: str, count: int = 1):
@@ -293,7 +292,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().timestamp()
     logger.info(f"User {user.id} started the bot in chat {chat.id}")
 
-    # Admin bypass: Everything is unprotected for the admin and admin is not registered as a user
+    # Step 1: Register user (including admin) in DB
+    for attempt in range(3):
+        try:
+            async with get_db() as conn:
+                await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
+                await conn.commit()
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+        except Exception as e:
+            logger.error(f"Unexpected DB error registering user: {e}")
+            break
+
+    # Admin bypass: Everything is unprotected for the admin (protect_content=False)
     if user.id == ADMIN_ID:
         logger.info(f"Admin {user.id} executed /start. Delivering unprotected content directly.")
         unprotected_text = CONFIG_CACHE.get("unprotected") or "Thanks for the cooperation, now forward this message as you wish."
@@ -307,12 +320,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send start message to admin: {e}")
         return
 
-    # Step 1: Check active job & register user in DB (with retry logic)
+    # Check active job for regular user
     has_active_job = False
     for attempt in range(3):
         try:
             async with get_db() as conn:
-                await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
                 async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
                     row = await cursor.fetchone()
                     if row:
@@ -322,8 +334,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() and attempt < 2:
                 await asyncio.sleep(0.1 * (attempt + 1))
-            else:
-                logger.warning(f"DB locked when checking active job for user {user.id}: {e}")
         except Exception as e:
             logger.error(f"Unexpected DB error checking active job: {e}")
             break
@@ -460,7 +470,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("Starting broadcast...")
     
     async with get_db() as conn:
-        async with conn.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_ID,)) as cursor:
+        async with conn.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
 
     total_users = len(rows)
@@ -469,8 +479,13 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for row in rows:
         target_user_id = row[0]
+        is_admin_target = (target_user_id == ADMIN_ID)
         try:
-            await context.bot.send_message(chat_id=target_user_id, text=broadcast_text, protect_content=True)
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=broadcast_text,
+                protect_content=not is_admin_target
+            )
             successful += 1
             await asyncio.sleep(0.04)  # Rate limiting safety delay
         except TelegramError as e:
@@ -494,7 +509,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     async with get_db() as conn:
-        async with conn.execute("SELECT COUNT(*) FROM users WHERE user_id != ?", (ADMIN_ID,)) as cursor:
+        async with conn.execute("SELECT COUNT(*) FROM users") as cursor:
             user_count_row = await cursor.fetchone()
             total_users = user_count_row[0] if user_count_row else 0
             
