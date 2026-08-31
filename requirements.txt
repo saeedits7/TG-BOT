@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue,webhooks]>=20.0
+python-telegram-bot[job-queue,webhooks,rate-limiter]>=20.0
 python-dotenv
