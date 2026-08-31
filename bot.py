@@ -1,4 +1,5 @@
 import aiosqlite
+import asyncio
 import logging
 import os
 from aiohttp import web
@@ -21,6 +22,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DB_FILE = "bot_data.db"
+
+# In-Memory Cache for Zero-Disk-Read Config Lookup
+CONFIG_CACHE = {
+    "protected": None,
+    "unprotected": None,
+    "delay": None
+}
+
+async def load_config_cache():
+    """Load configuration values from DB into memory cache."""
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute("SELECT key, value FROM config") as cursor:
+            rows = await cursor.fetchall()
+            for key, val in rows:
+                CONFIG_CACHE[key] = val
+    logger.info(f"Loaded config cache into memory: {CONFIG_CACHE}")
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -47,6 +64,14 @@ async def init_db():
         )
         await conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                joined_at REAL
+            )
+            """
+        )
+        await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -56,12 +81,12 @@ async def init_db():
         await conn.commit()
 
 async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
-    """Deletes the unprotected message after 2 minutes (120 seconds)."""
+    """Deletes messages automatically (used for user /start message and unprotected message)."""
     job = context.job
     chat_id = job.data["chat_id"]
     message_id = job.data["message_id"]
 
-    logger.info(f"Running auto-delete task for unprotected message {message_id} in chat {chat_id}")
+    logger.info(f"Running auto-delete task for message {message_id} in chat {chat_id}")
 
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -72,9 +97,9 @@ async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Unprotected message {message_id} in chat {chat_id} deleted automatically.")
+        logger.info(f"Message {message_id} in chat {chat_id} deleted automatically.")
     except TelegramError as e:
-        logger.warning(f"Failed to delete unprotected message {message_id} in chat {chat_id}: {e}")
+        logger.warning(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
 
 async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
     """The task that runs after delay to delete the protected message and send the unprotected one."""
@@ -85,7 +110,6 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Running unlock task for user {user_id} in chat {chat_id}")
 
-    # Remove from DB first so if something crashes below, we don't end up in an infinite retry loop
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
             await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
@@ -100,15 +124,8 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.warning(f"Failed to delete message {message_id}: {e}")
     
-    # 2. Send unprotected message
-    async with aiosqlite.connect(DB_FILE) as conn:
-        async with conn.execute("SELECT value FROM config WHERE key = 'unprotected'") as cursor:
-            row = await cursor.fetchone()
-        
-    if row:
-        unprotected_text = row[0]
-    else:
-        unprotected_text = "Thanks for the cooperation, now forward this message as you wish."
+    # 2. Send unprotected message (from RAM cache)
+    unprotected_text = CONFIG_CACHE.get("unprotected") or "Thanks for the cooperation, now forward this message as you wish."
         
     try:
         sent_unprotected = await context.bot.send_message(
@@ -145,26 +162,75 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command."""
+    """Handles the /start command using a single DB connection and RAM caching for max performance."""
     user = update.effective_user
     chat = update.effective_chat
     
     if not user or not chat:
         return
     
+    now = datetime.now().timestamp()
     logger.info(f"User {user.id} started the bot in chat {chat.id}")
 
-    # Schedule auto-deletion of user's /start command message after 30 seconds
-    if update.message:
+    # Single DB connection for all reads/writes per /start request
+    async with aiosqlite.connect(DB_FILE) as conn:
+        # Save user to users table
+        await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
+
+        # Check if active job already running
+        async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                logger.info(f"User {user.id} already has a pending job. Ignoring duplicate start.")
+                await conn.commit()
+                return
+
+        # Fetch protected text & timer delay from memory cache
+        protected_text = CONFIG_CACHE.get("protected") or (
+            "To forward this message tap this link-\n\n"
+            "https://t.me/sae_plays/3 (stay for 5-10 sec)"
+        )
+
+        raw_delay = CONFIG_CACHE.get("delay")
+        if raw_delay:
+            try:
+                current_delay = float(raw_delay)
+            except ValueError:
+                current_delay = UNLOCK_DELAY
+        else:
+            current_delay = UNLOCK_DELAY
+
+        unlock_time = now + current_delay
         start_delete_delay = 30.0
-        start_delete_time = datetime.now().timestamp() + start_delete_delay
-        async with aiosqlite.connect(DB_FILE) as conn:
+        start_delete_time = now + start_delete_delay
+
+        # Send protected message
+        try:
+            sent_message = await context.bot.send_message(
+                chat_id=chat.id,
+                text=protected_text,
+                protect_content=True
+            )
+            logger.info("Protected message sent.")
+        except TelegramError as e:
+            logger.error(f"Failed to send protected message: {e}")
+            await conn.commit()
+            return
+
+        # Batch insert jobs into database
+        await conn.execute(
+            "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
+            (user.id, chat.id, sent_message.message_id, unlock_time)
+        )
+        if update.message:
             await conn.execute(
                 "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
                 (chat.id, update.message.message_id, start_delete_time)
             )
-            await conn.commit()
+        await conn.commit()
 
+    # Schedule background tasks after single DB commit
+    if update.message:
         start_job_data = {
             "chat_id": chat.id,
             "message_id": update.message.message_id
@@ -177,71 +243,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         logger.info(f"Scheduled 30-second auto-deletion for user /start message {update.message.message_id} in chat {chat.id}.")
 
-    # Check if a job is already running for this user in this chat
-    async with aiosqlite.connect(DB_FILE) as conn:
-        async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
-            row = await cursor.fetchone()
-        
-    if row:
-        logger.info(f"User {user.id} already has a pending job. Ignoring duplicate start.")
-        return
-
-    # Send protected message
-    async with aiosqlite.connect(DB_FILE) as conn:
-        async with conn.execute("SELECT value FROM config WHERE key = 'protected'") as cursor:
-            row = await cursor.fetchone()
-
-    if row:
-        protected_text = row[0]
-    else:
-        protected_text = (
-            "To forward this message tap this link-\n\n"
-            "https://t.me/sae_plays/3 (stay for 5-10 sec)"
-        )
-    
-    try:
-        sent_message = await context.bot.send_message(
-            chat_id=chat.id,
-            text=protected_text,
-            protect_content=True
-        )
-        logger.info("Protected message sent.")
-    except TelegramError as e:
-        logger.error(f"Failed to send protected message: {e}")
-        return
-
-    # Calculate time and save to DB
-    now = datetime.now().timestamp()
-    
-    # Fetch dynamic delay or use default
-    async with aiosqlite.connect(DB_FILE) as conn:
-        async with conn.execute("SELECT value FROM config WHERE key = 'delay'") as cursor:
-            row = await cursor.fetchone()
-        
-    if row:
-        try:
-            current_delay = float(row[0])
-        except ValueError:
-            current_delay = UNLOCK_DELAY
-    else:
-        current_delay = UNLOCK_DELAY
-
-    unlock_time = now + current_delay
-
-    async with aiosqlite.connect(DB_FILE) as conn:
-        await conn.execute(
-            "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
-            (user.id, chat.id, sent_message.message_id, unlock_time)
-        )
-        await conn.commit()
-
-    # Schedule the background task
     job_data = {
         "user_id": user.id,
         "chat_id": chat.id,
         "message_id": sent_message.message_id
     }
-    
     logger.info("Unlock timer started.")
     context.job_queue.run_once(unlock_task, current_delay, data=job_data, name=f"unlock_{user.id}_{chat.id}")
 
@@ -258,6 +264,7 @@ async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('protected', ?)", (text,))
         await conn.commit()
+    CONFIG_CACHE["protected"] = text
     await update.message.reply_text("Protected message updated successfully!")
 
 
@@ -273,6 +280,7 @@ async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('unprotected', ?)", (text,))
         await conn.commit()
+    CONFIG_CACHE["unprotected"] = text
     await update.message.reply_text("Unprotected message updated successfully!")
 
 async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,8 +298,46 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
         await conn.commit()
+    CONFIG_CACHE["delay"] = str(delay)
     await update.message.reply_text(f"Timer successfully updated to {delay} seconds!")
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to broadcast a message to all registered bot users."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    
+    broadcast_text = update.message.text.partition(' ')[2]
+    if not broadcast_text:
+        await update.message.reply_text("Please provide text to broadcast. Example:\n/broadcast Hello everyone!")
+        return
+
+    status_msg = await update.message.reply_text("Starting broadcast...")
+    
+    async with aiosqlite.connect(DB_FILE) as conn:
+        async with conn.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+
+    total_users = len(rows)
+    successful = 0
+    failed = 0
+
+    for row in rows:
+        target_user_id = row[0]
+        try:
+            await context.bot.send_message(chat_id=target_user_id, text=broadcast_text)
+            successful += 1
+            await asyncio.sleep(0.04)  # Rate limiting safety delay
+        except TelegramError as e:
+            logger.warning(f"Broadcast failed for user {target_user_id}: {e}")
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ Broadcast Completed!\n\n"
+        f"📊 Total Users: {total_users}\n"
+        f"🟢 Delivered: {successful}\n"
+        f"🔴 Failed/Blocked: {failed}"
+    )
 
 async def recover_jobs(application):
     """Recover pending jobs and cleanup tasks from the database after a restart."""
@@ -358,6 +404,7 @@ async def start_webserver():
 async def post_init(application):
     """Run this after the bot initializes."""
     await init_db()
+    await load_config_cache()
     await recover_jobs(application)
     await start_webserver()
 
@@ -368,12 +415,19 @@ def main():
 
     logger.info("Bot starting...")
 
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
     application.add_handler(CommandHandler("settimer", set_timer))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
 
     application.run_polling()
 
