@@ -235,6 +235,22 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
     await process_unlock(context, user_id, chat_id, message_id, start_message_id)
 
+async def auto_expire_active_job(context: ContextTypes.DEFAULT_TYPE):
+    """Resets active job restriction after 2 minutes if user hasn't clicked button."""
+    job = context.job
+    user_id = job.data["user_id"]
+    chat_id = job.data["chat_id"]
+    for attempt in range(5):
+        try:
+            async with get_db() as conn:
+                await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+                await conn.commit()
+            break
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+    logger.info(f"Active job restriction for user {user_id} automatically expired and reset after 2 minutes.")
+
 async def forward_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles tap on 'CLICK HERE TO FORWARD' button."""
     query = update.callback_query
@@ -271,9 +287,12 @@ async def forward_button_callback(update: Update, context: ContextTypes.DEFAULT_
             if attempt < 4:
                 await asyncio.sleep(0.1 * (attempt + 1))
 
-    # Cancel scheduled job timer if running
+    # Cancel scheduled job timers if running
     jobs = context.job_queue.get_jobs_by_name(f"unlock_{user_id}_{chat_id}")
     for job in jobs:
+        job.schedule_removal()
+    expire_jobs = context.job_queue.get_jobs_by_name(f"expire_job_{user_id}_{chat_id}")
+    for job in expire_jobs:
         job.schedule_removal()
 
     # Trigger immediate unlock & cleanup
@@ -320,7 +339,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send start message to admin: {e}")
         return
 
-    # Check active job for regular user
+    # Check active job for regular user (resets after 2 minutes / 120 seconds)
     has_active_job = False
     for attempt in range(3):
         try:
@@ -328,7 +347,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
                     row = await cursor.fetchone()
                     if row:
-                        has_active_job = True
+                        job_created_time = row[0]
+                        if job_created_time > 0 and (now - job_created_time) < 120.0:
+                            has_active_job = True
+                        else:
+                            # Job is older than 2 minutes (120s), expire and allow new start
+                            await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id))
                 await conn.commit()
             break
         except sqlite3.OperationalError as e:
@@ -339,7 +363,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if has_active_job:
-        logger.info(f"User {user.id} already has a pending job. Ignoring duplicate start.")
+        logger.info(f"User {user.id} already has a pending job (< 2 min old). Ignoring duplicate start.")
         return
 
     # Step 2: Fetch protected text & timer delay from memory cache (Zero Disk Read)
@@ -385,13 +409,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send protected message to {chat.id}: {e}")
         return
 
-    # Step 4: Record active job in DB without timer (deletion happens ONLY on button tap)
+    # Step 4: Record active job in DB with timestamp & schedule 2-minute auto-expiration
     for attempt in range(5):
         try:
             async with get_db() as conn:
                 await conn.execute(
-                    "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time, start_message_id) VALUES (?, ?, ?, ?, ?)",
-                    (user.id, chat.id, sent_message.message_id, 0.0, start_msg_id)
+                    "INSERT OR REPLACE INTO active_jobs (user_id, chat_id, message_id, unlock_time, start_message_id) VALUES (?, ?, ?, ?, ?)",
+                    (user.id, chat.id, sent_message.message_id, now, start_msg_id)
                 )
                 await conn.commit()
             break
@@ -404,7 +428,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Unexpected DB error recording job: {e}")
             break
 
-    logger.info(f"Active job registered for user {user.id}. Awaiting button tap.")
+    # Schedule auto-expiration after 120 seconds (2 minutes)
+    job_data = {"user_id": user.id, "chat_id": chat.id}
+    context.job_queue.run_once(
+        auto_expire_active_job,
+        120.0,
+        data=job_data,
+        name=f"expire_job_{user.id}_{chat.id}"
+    )
+
+    logger.info(f"Active job registered for user {user.id}. Will auto-reset after 2 minutes if button not tapped.")
 
 
 async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,9 +635,12 @@ async def handle_redirect(request):
             
             # Trigger asynchronous message deletion and unlock
             if message_id:
-                # Cancel timer if running
+                # Cancel timers if running
                 jobs = GLOBAL_APP.job_queue.get_jobs_by_name(f"unlock_{user_id}_{chat_id}")
                 for job in jobs:
+                    job.schedule_removal()
+                expire_jobs = GLOBAL_APP.job_queue.get_jobs_by_name(f"expire_job_{user_id}_{chat_id}")
+                for job in expire_jobs:
                     job.schedule_removal()
                 
                 asyncio.create_task(process_unlock(GLOBAL_APP, user_id, chat_id, message_id, start_message_id))
