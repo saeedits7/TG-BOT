@@ -97,7 +97,32 @@ async def init_db():
             )
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+            """
+        )
         await conn.commit()
+
+async def increment_stat(key: str, count: int = 1):
+    for attempt in range(5):
+        try:
+            async with get_db() as conn:
+                await conn.execute(
+                    "INSERT INTO stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = value + ?",
+                    (key, count, count)
+                )
+                await conn.commit()
+            break
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+            else:
+                logger.error(f"Failed to increment stat {key}: {e}")
+
 
 async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
     """Deletes messages automatically (used for user /start message and unprotected message)."""
@@ -220,6 +245,7 @@ async def forward_button_callback(update: Update, context: ContextTypes.DEFAULT_
     chat_id = query.message.chat_id if query.message else user_id
 
     logger.info(f"User {user_id} clicked forward button in chat {chat_id}")
+    asyncio.create_task(increment_stat("button_taps"))
 
     # Answer callback query so button loading animation stops cleanly
     try:
@@ -329,6 +355,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             protect_content=True
         )
         logger.info("Protected message with inline button sent.")
+        asyncio.create_task(increment_stat("protected_sent"))
     except TelegramError as e:
         logger.error(f"Failed to send protected message to {chat.id}: {e}")
         return
@@ -405,7 +432,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Timer successfully updated to {delay} seconds!")
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to broadcast a message to all registered bot users."""
+    """Admin command to broadcast a protected message to all registered bot users."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
@@ -428,19 +455,48 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for row in rows:
         target_user_id = row[0]
         try:
-            await context.bot.send_message(chat_id=target_user_id, text=broadcast_text)
+            await context.bot.send_message(chat_id=target_user_id, text=broadcast_text, protect_content=True)
             successful += 1
             await asyncio.sleep(0.04)  # Rate limiting safety delay
         except TelegramError as e:
             logger.warning(f"Broadcast failed for user {target_user_id}: {e}")
             failed += 1
 
+    if successful > 0:
+        asyncio.create_task(increment_stat("protected_sent", successful))
+
     await status_msg.edit_text(
         f"✅ Broadcast Completed!\n\n"
         f"📊 Total Users: {total_users}\n"
-        f"🟢 Delivered: {successful}\n"
+        f"🟢 Delivered (Protected): {successful}\n"
         f"🔴 Failed/Blocked: {failed}"
     )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to view bot usage statistics."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+    
+    async with get_db() as conn:
+        async with conn.execute("SELECT COUNT(*) FROM users") as cursor:
+            user_count_row = await cursor.fetchone()
+            total_users = user_count_row[0] if user_count_row else 0
+            
+        async with conn.execute("SELECT key, value FROM stats") as cursor:
+            rows = await cursor.fetchall()
+            stats_dict = dict(rows)
+
+    button_taps = stats_dict.get("button_taps", 0)
+    protected_sent = stats_dict.get("protected_sent", 0)
+
+    msg = (
+        "📊 *Bot Statistics*\n\n"
+        f"👥 *Users Started Bot:* {total_users}\n"
+        f"🔘 *Button Taps:* {button_taps}\n"
+        f"🔒 *Protected Messages Delivered:* {protected_sent}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def recover_jobs(application):
     """Recover pending jobs and cleanup tasks from the database after a restart."""
@@ -502,6 +558,7 @@ async def handle_redirect(request):
         try:
             user_id = int(user_id_str)
             chat_id = int(chat_id_str)
+            asyncio.create_task(increment_stat("button_taps"))
             
             # Retrieve active job info from DB
             message_id = None
@@ -572,6 +629,7 @@ def main():
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
     application.add_handler(CommandHandler("settimer", set_timer))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("stats", stats_command))
 
     application.run_polling()
 
