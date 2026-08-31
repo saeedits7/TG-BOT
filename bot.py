@@ -15,7 +15,7 @@ from telegram.error import TelegramError
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
-FORWARD_LINK = os.getenv("FORWARD_LINK", "https://t.me/sae_plays/15")
+FORWARD_LINK = os.getenv("FORWARD_LINK", "https://t.me/sae_plays/16")
 
 # Configure Logging
 logging.basicConfig(
