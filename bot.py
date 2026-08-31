@@ -310,9 +310,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     start_msg_id = update.message.message_id if update.message else None
 
-    # Create Glassmorphism / Link style callback button
+    # Create Glassmorphism / Link style URL button
     keyboard = [
-        [InlineKeyboardButton("🔗 CLICK HERE TO FORWARD 🔗", callback_data="forward_click")]
+        [InlineKeyboardButton("🔗 CLICK HERE TO FORWARD 🔗", url=FORWARD_LINK)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
