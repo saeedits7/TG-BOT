@@ -2,6 +2,7 @@ import aiosqlite
 import asyncio
 import logging
 import os
+import sqlite3
 from aiohttp import web
 from datetime import datetime
 from dotenv import load_dotenv
@@ -22,6 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DB_FILE = "bot_data.db"
+DB_TIMEOUT = 60.0
 
 # In-Memory Cache for Zero-Disk-Read Config Lookup
 CONFIG_CACHE = {
@@ -30,17 +32,27 @@ CONFIG_CACHE = {
     "delay": None
 }
 
+async def get_db_connection():
+    """Returns an aiosqlite connection configured with WAL mode and high busy_timeout."""
+    conn = await aiosqlite.connect(DB_FILE, timeout=DB_TIMEOUT)
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA busy_timeout=60000;")
+    return conn
+
 async def load_config_cache():
     """Load configuration values from DB into memory cache."""
-    async with aiosqlite.connect(DB_FILE) as conn:
-        async with conn.execute("SELECT key, value FROM config") as cursor:
-            rows = await cursor.fetchall()
-            for key, val in rows:
-                CONFIG_CACHE[key] = val
-    logger.info(f"Loaded config cache into memory: {CONFIG_CACHE}")
+    try:
+        async with (await get_db_connection()) as conn:
+            async with conn.execute("SELECT key, value FROM config") as cursor:
+                rows = await cursor.fetchall()
+                for key, val in rows:
+                    CONFIG_CACHE[key] = val
+        logger.info(f"Loaded config cache into memory: {CONFIG_CACHE}")
+    except Exception as e:
+        logger.error(f"Failed to load config cache: {e}")
 
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS active_jobs (
@@ -88,12 +100,17 @@ async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Running auto-delete task for message {message_id} in chat {chat_id}")
 
-    try:
-        async with aiosqlite.connect(DB_FILE) as conn:
-            await conn.execute("DELETE FROM cleanup_jobs WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
-            await conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to remove cleanup job from DB: {e}")
+    for attempt in range(5):
+        try:
+            async with (await get_db_connection()) as conn:
+                await conn.execute("DELETE FROM cleanup_jobs WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
+                await conn.commit()
+            break
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+            else:
+                logger.error(f"Failed to remove cleanup job from DB: {e}")
 
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -110,12 +127,17 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Running unlock task for user {user_id} in chat {chat_id}")
 
-    try:
-        async with aiosqlite.connect(DB_FILE) as conn:
-            await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
-            await conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to remove job from DB: {e}")
+    for attempt in range(5):
+        try:
+            async with (await get_db_connection()) as conn:
+                await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+                await conn.commit()
+            break
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+            else:
+                logger.error(f"Failed to remove job from DB: {e}")
 
     # 1. Delete protected message
     try:
@@ -139,12 +161,20 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
         delete_delay = 120.0
         delete_time = datetime.now().timestamp() + delete_delay
         
-        async with aiosqlite.connect(DB_FILE) as conn:
-            await conn.execute(
-                "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
-                (chat_id, sent_unprotected.message_id, delete_time)
-            )
-            await conn.commit()
+        for attempt in range(5):
+            try:
+                async with (await get_db_connection()) as conn:
+                    await conn.execute(
+                        "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
+                        (chat_id, sent_unprotected.message_id, delete_time)
+                    )
+                    await conn.commit()
+                break
+            except Exception as e:
+                if attempt < 4:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+                else:
+                    logger.error(f"Failed to record cleanup job in DB: {e}")
             
         cleanup_job_data = {
             "chat_id": chat_id,
@@ -162,7 +192,7 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command using a single DB connection and RAM caching for max performance."""
+    """Handles the /start command with WAL mode, busy timeout, retries, and high concurrency resilience."""
     user = update.effective_user
     chat = update.effective_chat
     
@@ -172,64 +202,87 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().timestamp()
     logger.info(f"User {user.id} started the bot in chat {chat.id}")
 
-    # Single DB connection for all reads/writes per /start request
-    async with aiosqlite.connect(DB_FILE) as conn:
-        # Save user to users table
-        await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
-
-        # Check if active job already running
-        async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                logger.info(f"User {user.id} already has a pending job. Ignoring duplicate start.")
-                await conn.commit()
-                return
-
-        # Fetch protected text & timer delay from memory cache
-        protected_text = CONFIG_CACHE.get("protected") or (
-            "To forward this message tap this link-\n\n"
-            "https://t.me/sae_plays/3 (stay for 5-10 sec)"
-        )
-
-        raw_delay = CONFIG_CACHE.get("delay")
-        if raw_delay:
-            try:
-                current_delay = float(raw_delay)
-            except ValueError:
-                current_delay = UNLOCK_DELAY
-        else:
-            current_delay = UNLOCK_DELAY
-
-        unlock_time = now + current_delay
-        start_delete_delay = 30.0
-        start_delete_time = now + start_delete_delay
-
-        # Send protected message
+    # Step 1: Check active job & register user in DB (with retry logic)
+    has_active_job = False
+    for attempt in range(3):
         try:
-            sent_message = await context.bot.send_message(
-                chat_id=chat.id,
-                text=protected_text,
-                protect_content=True
-            )
-            logger.info("Protected message sent.")
-        except TelegramError as e:
-            logger.error(f"Failed to send protected message: {e}")
-            await conn.commit()
-            return
+            async with (await get_db_connection()) as conn:
+                await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
+                async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        has_active_job = True
+                await conn.commit()
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 2:
+                await asyncio.sleep(0.1 * (attempt + 1))
+            else:
+                logger.warning(f"DB locked when checking active job for user {user.id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected DB error checking active job: {e}")
+            break
 
-        # Batch insert jobs into database
-        await conn.execute(
-            "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
-            (user.id, chat.id, sent_message.message_id, unlock_time)
+    if has_active_job:
+        logger.info(f"User {user.id} already has a pending job. Ignoring duplicate start.")
+        return
+
+    # Step 2: Fetch protected text & timer delay from memory cache (Zero Disk Read)
+    protected_text = CONFIG_CACHE.get("protected") or (
+        "To forward this message tap this link-\n\n"
+        "https://t.me/sae_plays/3 (stay for 5-10 sec)"
+    )
+
+    raw_delay = CONFIG_CACHE.get("delay")
+    if raw_delay:
+        try:
+            current_delay = float(raw_delay)
+        except ValueError:
+            current_delay = UNLOCK_DELAY
+    else:
+        current_delay = UNLOCK_DELAY
+
+    unlock_time = now + current_delay
+    start_delete_delay = 30.0
+    start_delete_time = now + start_delete_delay
+
+    # Step 3: Send protected message (GUARANTEED delivery to user!)
+    try:
+        sent_message = await context.bot.send_message(
+            chat_id=chat.id,
+            text=protected_text,
+            protect_content=True
         )
-        if update.message:
-            await conn.execute(
-                "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
-                (chat.id, update.message.message_id, start_delete_time)
-            )
-        await conn.commit()
+        logger.info("Protected message sent.")
+    except TelegramError as e:
+        logger.error(f"Failed to send protected message to {chat.id}: {e}")
+        return
 
-    # Schedule background tasks after single DB commit
+    # Step 4: Record jobs in DB (with retry logic)
+    for attempt in range(5):
+        try:
+            async with (await get_db_connection()) as conn:
+                await conn.execute(
+                    "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
+                    (user.id, chat.id, sent_message.message_id, unlock_time)
+                )
+                if update.message:
+                    await conn.execute(
+                        "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
+                        (chat.id, update.message.message_id, start_delete_time)
+                    )
+                await conn.commit()
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+            else:
+                logger.error(f"Failed to record jobs in DB for user {user.id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected DB error recording jobs: {e}")
+            break
+
+    # Step 5: Schedule background tasks
     if update.message:
         start_job_data = {
             "chat_id": chat.id,
@@ -261,7 +314,7 @@ async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Please provide the text. Example:\n/setprotected Hello World")
         return
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('protected', ?)", (text,))
         await conn.commit()
     CONFIG_CACHE["protected"] = text
@@ -277,7 +330,7 @@ async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Please provide the text. Example:\n/setunprotected Hello World")
         return
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('unprotected', ?)", (text,))
         await conn.commit()
     CONFIG_CACHE["unprotected"] = text
@@ -295,7 +348,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 7.5 or /settimer 10")
         return
     
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
         await conn.commit()
     CONFIG_CACHE["delay"] = str(delay)
@@ -314,7 +367,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("Starting broadcast...")
     
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         async with conn.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
 
@@ -344,7 +397,7 @@ async def recover_jobs(application):
     now = datetime.now().timestamp()
     
     # 1. Recover unlock active_jobs
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         async with conn.execute("SELECT user_id, chat_id, message_id, unlock_time FROM active_jobs") as cursor:
             rows = await cursor.fetchall()
         
@@ -366,7 +419,7 @@ async def recover_jobs(application):
             application.job_queue.run_once(unlock_task, remaining, data=job_data, name=f"unlock_{user_id}_{chat_id}")
 
     # 2. Recover auto-delete cleanup_jobs
-    async with aiosqlite.connect(DB_FILE) as conn:
+    async with (await get_db_connection()) as conn:
         async with conn.execute("SELECT chat_id, message_id, delete_time FROM cleanup_jobs") as cursor:
             cleanup_rows = await cursor.fetchall()
 
