@@ -154,13 +154,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"User {user.id} started the bot in chat {chat.id}")
 
-    # Delete the user's /start command message to keep the chat clean
+    # Schedule auto-deletion of user's /start command message after 30 seconds
     if update.message:
-        try:
-            await update.message.delete()
-            logger.info(f"Deleted /start command message from user {user.id} in chat {chat.id}")
-        except TelegramError as e:
-            logger.warning(f"Could not delete /start command message: {e}")
+        start_delete_delay = 30.0
+        start_delete_time = datetime.now().timestamp() + start_delete_delay
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
+                (chat.id, update.message.message_id, start_delete_time)
+            )
+            await conn.commit()
+
+        start_job_data = {
+            "chat_id": chat.id,
+            "message_id": update.message.message_id
+        }
+        context.job_queue.run_once(
+            delete_unprotected_task,
+            start_delete_delay,
+            data=start_job_data,
+            name=f"delete_start_{chat.id}_{update.message.message_id}"
+        )
+        logger.info(f"Scheduled 30-second auto-deletion for user /start message {update.message.message_id} in chat {chat.id}.")
 
     # Check if a job is already running for this user in this chat
     async with aiosqlite.connect(DB_FILE) as conn:
