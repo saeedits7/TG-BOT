@@ -310,9 +310,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     start_msg_id = update.message.message_id if update.message else None
 
+    # Construct dynamic redirect link for instant HTTP 302 redirection + clean-up trigger
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "https://tg-bot-2gkj.onrender.com").rstrip('/')
+    redirect_url = f"{base_url}/redirect?user_id={user.id}&chat_id={chat.id}"
+
     # Create Glassmorphism / Link style URL button
     keyboard = [
-        [InlineKeyboardButton("🔗 CLICK HERE TO FORWARD 🔗", url=FORWARD_LINK)]
+        [InlineKeyboardButton("🔗 CLICK HERE TO FORWARD 🔗", url=redirect_url)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -513,22 +517,61 @@ async def recover_jobs(application):
             application.job_queue.run_once(delete_unprotected_task, remaining, data=cleanup_job_data, name=f"delete_unprotected_{chat_id}_{message_id}")
 
 
+GLOBAL_APP = None
+
+async def handle_redirect(request):
+    """Handles button click web redirect, unlocks message instantly, and sends user to destination link."""
+    user_id_str = request.query.get("user_id")
+    chat_id_str = request.query.get("chat_id")
+    
+    if user_id_str and chat_id_str and GLOBAL_APP:
+        try:
+            user_id = int(user_id_str)
+            chat_id = int(chat_id_str)
+            
+            # Retrieve active job info from DB
+            message_id = None
+            start_message_id = None
+            async with get_db() as conn:
+                async with conn.execute("SELECT message_id, start_message_id FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        message_id = row[0]
+                        start_message_id = row[1]
+            
+            # Trigger asynchronous message deletion and unlock
+            if message_id:
+                # Cancel timer if running
+                jobs = GLOBAL_APP.job_queue.get_jobs_by_name(f"unlock_{user_id}_{chat_id}")
+                for job in jobs:
+                    job.schedule_removal()
+                
+                asyncio.create_task(process_unlock(GLOBAL_APP, user_id, chat_id, message_id, start_message_id))
+        except Exception as e:
+            logger.error(f"Error handling web redirect unlock: {e}")
+
+    # Instant HTTP 302 Redirect to destination Telegram link
+    return web.HTTPFound(location=FORWARD_LINK)
+
 async def health_check(request):
     return web.Response(text="Bot is running!")
 
 async def start_webserver():
-    """Starts a dummy web server so Render detects open port instantly."""
+    """Starts the web server with redirect endpoint."""
     app = web.Application()
+    app.router.add_get('/redirect', handle_redirect)
     app.router.add_route('*', '/{tail:.*}', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Dummy web server started on port {port}")
+    logger.info(f"Web server started on port {port}")
 
 async def post_init(application):
     """Run this after the bot initializes."""
+    global GLOBAL_APP
+    GLOBAL_APP = application
     await start_webserver()  # Bind port IMMEDIATELY for Render port scanner
     await init_db()
     await load_config_cache()
