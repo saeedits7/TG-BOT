@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 10))
+UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 7.5))
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
 
 # Configure Logging
@@ -77,7 +77,7 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
     if row:
         unprotected_text = row[0]
     else:
-        unprotected_text = "Thanks for the corporateion, now forward this message as you wish ."
+        unprotected_text = "Thanks for the cooperation, now forward this message as you wish."
         
     try:
         await context.bot.send_message(
@@ -119,8 +119,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         protected_text = (
             "To forward this message tap this link-\n\n"
-            "https://t.me/sae_plays/3 (wait for 5 to 10 seconds)\n\n"
-            "Then come back to this bot to forward this message as you wish ."
+            "https://t.me/sae_plays/3 (stay for 5-10 sec)"
         )
     
     try:
