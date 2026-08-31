@@ -333,52 +333,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send protected message to {chat.id}: {e}")
         return
 
-    # Step 4: Record jobs in DB (with retry logic)
+    # Step 4: Record active job in DB without timer (deletion happens ONLY on button tap)
     for attempt in range(5):
         try:
             async with get_db() as conn:
                 await conn.execute(
                     "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time, start_message_id) VALUES (?, ?, ?, ?, ?)",
-                    (user.id, chat.id, sent_message.message_id, unlock_time, start_msg_id)
+                    (user.id, chat.id, sent_message.message_id, 0.0, start_msg_id)
                 )
-                if update.message:
-                    await conn.execute(
-                        "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
-                        (chat.id, update.message.message_id, start_delete_time)
-                    )
                 await conn.commit()
             break
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() and attempt < 4:
                 await asyncio.sleep(0.1 * (attempt + 1))
             else:
-                logger.error(f"Failed to record jobs in DB for user {user.id}: {e}")
+                logger.error(f"Failed to record active job in DB for user {user.id}: {e}")
         except Exception as e:
-            logger.error(f"Unexpected DB error recording jobs: {e}")
+            logger.error(f"Unexpected DB error recording job: {e}")
             break
 
-    # Step 5: Schedule background tasks
-    if update.message:
-        start_job_data = {
-            "chat_id": chat.id,
-            "message_id": update.message.message_id
-        }
-        context.job_queue.run_once(
-            delete_unprotected_task,
-            start_delete_delay,
-            data=start_job_data,
-            name=f"delete_start_{chat.id}_{update.message.message_id}"
-        )
-        logger.info(f"Scheduled 30-second auto-deletion for user /start message {update.message.message_id} in chat {chat.id}.")
-
-    job_data = {
-        "user_id": user.id,
-        "chat_id": chat.id,
-        "message_id": sent_message.message_id,
-        "start_message_id": start_msg_id
-    }
-    logger.info("Unlock timer started.")
-    context.job_queue.run_once(unlock_task, current_delay, data=job_data, name=f"unlock_{user.id}_{chat.id}")
+    logger.info(f"Active job registered for user {user.id}. Awaiting button tap.")
 
 
 async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
