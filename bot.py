@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 from aiohttp import web
+from contextlib import asynccontextmanager
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -32,17 +33,18 @@ CONFIG_CACHE = {
     "delay": None
 }
 
-async def get_db_connection():
-    """Returns an aiosqlite connection configured with WAL mode and high busy_timeout."""
-    conn = await aiosqlite.connect(DB_FILE, timeout=DB_TIMEOUT)
-    await conn.execute("PRAGMA journal_mode=WAL;")
-    await conn.execute("PRAGMA busy_timeout=60000;")
-    return conn
+@asynccontextmanager
+async def get_db():
+    """Async context manager for aiosqlite configured with WAL mode and high busy_timeout."""
+    async with aiosqlite.connect(DB_FILE, timeout=DB_TIMEOUT) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA busy_timeout=60000;")
+        yield conn
 
 async def load_config_cache():
     """Load configuration values from DB into memory cache."""
     try:
-        async with (await get_db_connection()) as conn:
+        async with get_db() as conn:
             async with conn.execute("SELECT key, value FROM config") as cursor:
                 rows = await cursor.fetchall()
                 for key, val in rows:
@@ -52,7 +54,7 @@ async def load_config_cache():
         logger.error(f"Failed to load config cache: {e}")
 
 async def init_db():
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS active_jobs (
@@ -102,7 +104,7 @@ async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
 
     for attempt in range(5):
         try:
-            async with (await get_db_connection()) as conn:
+            async with get_db() as conn:
                 await conn.execute("DELETE FROM cleanup_jobs WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
                 await conn.commit()
             break
@@ -129,7 +131,7 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
 
     for attempt in range(5):
         try:
-            async with (await get_db_connection()) as conn:
+            async with get_db() as conn:
                 await conn.execute("DELETE FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
                 await conn.commit()
             break
@@ -163,7 +165,7 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
         
         for attempt in range(5):
             try:
-                async with (await get_db_connection()) as conn:
+                async with get_db() as conn:
                     await conn.execute(
                         "INSERT OR REPLACE INTO cleanup_jobs (chat_id, message_id, delete_time) VALUES (?, ?, ?)",
                         (chat_id, sent_unprotected.message_id, delete_time)
@@ -206,7 +208,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_active_job = False
     for attempt in range(3):
         try:
-            async with (await get_db_connection()) as conn:
+            async with get_db() as conn:
                 await conn.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user.id, now))
                 async with conn.execute("SELECT unlock_time FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user.id, chat.id)) as cursor:
                     row = await cursor.fetchone()
@@ -261,7 +263,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Step 4: Record jobs in DB (with retry logic)
     for attempt in range(5):
         try:
-            async with (await get_db_connection()) as conn:
+            async with get_db() as conn:
                 await conn.execute(
                     "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
                     (user.id, chat.id, sent_message.message_id, unlock_time)
@@ -314,7 +316,7 @@ async def set_protected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Please provide the text. Example:\n/setprotected Hello World")
         return
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('protected', ?)", (text,))
         await conn.commit()
     CONFIG_CACHE["protected"] = text
@@ -330,7 +332,7 @@ async def set_unprotected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Please provide the text. Example:\n/setunprotected Hello World")
         return
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('unprotected', ?)", (text,))
         await conn.commit()
     CONFIG_CACHE["unprotected"] = text
@@ -348,7 +350,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 7.5 or /settimer 10")
         return
     
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
         await conn.commit()
     CONFIG_CACHE["delay"] = str(delay)
@@ -367,7 +369,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("Starting broadcast...")
     
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         async with conn.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
 
@@ -397,7 +399,7 @@ async def recover_jobs(application):
     now = datetime.now().timestamp()
     
     # 1. Recover unlock active_jobs
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         async with conn.execute("SELECT user_id, chat_id, message_id, unlock_time FROM active_jobs") as cursor:
             rows = await cursor.fetchall()
         
@@ -419,7 +421,7 @@ async def recover_jobs(application):
             application.job_queue.run_once(unlock_task, remaining, data=job_data, name=f"unlock_{user_id}_{chat_id}")
 
     # 2. Recover auto-delete cleanup_jobs
-    async with (await get_db_connection()) as conn:
+    async with get_db() as conn:
         async with conn.execute("SELECT chat_id, message_id, delete_time FROM cleanup_jobs") as cursor:
             cleanup_rows = await cursor.fetchall()
 
