@@ -105,6 +105,7 @@ async def init_db():
             )
             """
         )
+        await conn.execute("DELETE FROM users WHERE user_id = ?", (ADMIN_ID,))
         await conn.commit()
 
 async def increment_stat(key: str, count: int = 1):
@@ -292,6 +293,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().timestamp()
     logger.info(f"User {user.id} started the bot in chat {chat.id}")
 
+    # Admin bypass: Everything is unprotected for the admin and admin is not registered as a user
+    if user.id == ADMIN_ID:
+        logger.info(f"Admin {user.id} executed /start. Delivering unprotected content directly.")
+        unprotected_text = CONFIG_CACHE.get("unprotected") or "Thanks for the cooperation, now forward this message as you wish."
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=unprotected_text,
+                protect_content=False
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send start message to admin: {e}")
+        return
+
     # Step 1: Check active job & register user in DB (with retry logic)
     has_active_job = False
     for attempt in range(3):
@@ -445,7 +460,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("Starting broadcast...")
     
     async with get_db() as conn:
-        async with conn.execute("SELECT user_id FROM users") as cursor:
+        async with conn.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_ID,)) as cursor:
             rows = await cursor.fetchall()
 
     total_users = len(rows)
@@ -479,7 +494,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     async with get_db() as conn:
-        async with conn.execute("SELECT COUNT(*) FROM users") as cursor:
+        async with conn.execute("SELECT COUNT(*) FROM users WHERE user_id != ?", (ADMIN_ID,)) as cursor:
             user_count_row = await cursor.fetchone()
             total_users = user_count_row[0] if user_count_row else 0
             
