@@ -11,11 +11,15 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.error import TelegramError
 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 7.5))
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
+FORWARD_LINK = os.getenv("FORWARD_LINK", "https://t.me/sae_plays/3")
 
 # Configure Logging
 logging.basicConfig(
@@ -62,6 +66,7 @@ async def init_db():
                 chat_id INTEGER,
                 message_id INTEGER,
                 unlock_time REAL,
+                start_message_id INTEGER,
                 PRIMARY KEY (user_id, chat_id)
             )
             """
@@ -120,14 +125,9 @@ async def delete_unprotected_task(context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.warning(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
 
-async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
-    """The task that runs after delay to delete the protected message and send the unprotected one."""
-    job = context.job
-    user_id = job.data["user_id"]
-    chat_id = job.data["chat_id"]
-    message_id = job.data["message_id"]
-
-    logger.info(f"Running unlock task for user {user_id} in chat {chat_id}")
+async def process_unlock(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int, message_id: int, start_message_id: int = None):
+    """Deletes protected message & /start message, and sends unprotected message."""
+    logger.info(f"Processing unlock for user {user_id} in chat {chat_id}")
 
     for attempt in range(5):
         try:
@@ -147,8 +147,16 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Protected message {message_id} deleted successfully.")
     except TelegramError as e:
         logger.warning(f"Failed to delete message {message_id}: {e}")
-    
-    # 2. Send unprotected message (from RAM cache)
+
+    # 2. Delete /start message if provided
+    if start_message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=start_message_id)
+            logger.info(f"Start message {start_message_id} deleted successfully.")
+        except TelegramError as e:
+            logger.warning(f"Failed to delete start message {start_message_id}: {e}")
+
+    # 3. Send unprotected message (from RAM cache)
     unprotected_text = CONFIG_CACHE.get("unprotected") or "Thanks for the cooperation, now forward this message as you wish."
         
     try:
@@ -192,6 +200,64 @@ async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.error(f"Failed to send unprotected message to {chat_id}: {e}")
 
+async def unlock_task(context: ContextTypes.DEFAULT_TYPE):
+    """The task that runs after delay to unlock if user didn't tap button."""
+    job = context.job
+    user_id = job.data["user_id"]
+    chat_id = job.data["chat_id"]
+    message_id = job.data["message_id"]
+    start_message_id = job.data.get("start_message_id")
+
+    await process_unlock(context, user_id, chat_id, message_id, start_message_id)
+
+async def forward_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles tap on 'CLICK HERE TO FORWARD' button."""
+    query = update.callback_query
+    if not query:
+        return
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id if query.message else user_id
+
+    logger.info(f"User {user_id} clicked forward button in chat {chat_id}")
+
+    # Answer query to open the target link in browser/telegram app
+    try:
+        await query.answer(url=FORWARD_LINK)
+    except Exception as e:
+        logger.warning(f"Could not answer callback query with URL: {e}")
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    # Retrieve and remove active job info for this user
+    start_message_id = None
+    message_id = query.message.message_id if query.message else None
+
+    for attempt in range(5):
+        try:
+            async with get_db() as conn:
+                async with conn.execute("SELECT message_id, start_message_id FROM active_jobs WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        message_id = row[0]
+                        start_message_id = row[1]
+                await conn.commit()
+            break
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+    # Cancel scheduled job timer if running
+    jobs = context.job_queue.get_jobs_by_name(f"unlock_{user_id}_{chat_id}")
+    for job in jobs:
+        job.schedule_removal()
+
+    # Trigger immediate unlock & cleanup
+    if message_id:
+        await process_unlock(context, user_id, chat_id, message_id, start_message_id)
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command with WAL mode, busy timeout, retries, and high concurrency resilience."""
@@ -230,10 +296,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Step 2: Fetch protected text & timer delay from memory cache (Zero Disk Read)
-    protected_text = CONFIG_CACHE.get("protected") or (
-        "To forward this message tap this link-\n\n"
-        "https://t.me/sae_plays/3 (stay for 5-10 sec)"
-    )
+    default_text = "To forward this message please click the following button:\n\n⬇️             ⬇️             ⬇️"
+    protected_text = CONFIG_CACHE.get("protected") or default_text
 
     raw_delay = CONFIG_CACHE.get("delay")
     if raw_delay:
@@ -248,14 +312,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_delete_delay = 30.0
     start_delete_time = now + start_delete_delay
 
+    start_msg_id = update.message.message_id if update.message else None
+
+    # Create Glassmorphism / Link style callback button
+    keyboard = [
+        [InlineKeyboardButton("🔗 CLICK HERE TO FORWARD 🔗", callback_data="forward_click")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     # Step 3: Send protected message (GUARANTEED delivery to user!)
     try:
         sent_message = await context.bot.send_message(
             chat_id=chat.id,
             text=protected_text,
+            reply_markup=reply_markup,
             protect_content=True
         )
-        logger.info("Protected message sent.")
+        logger.info("Protected message with inline button sent.")
     except TelegramError as e:
         logger.error(f"Failed to send protected message to {chat.id}: {e}")
         return
@@ -265,8 +338,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             async with get_db() as conn:
                 await conn.execute(
-                    "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time) VALUES (?, ?, ?, ?)",
-                    (user.id, chat.id, sent_message.message_id, unlock_time)
+                    "INSERT INTO active_jobs (user_id, chat_id, message_id, unlock_time, start_message_id) VALUES (?, ?, ?, ?, ?)",
+                    (user.id, chat.id, sent_message.message_id, unlock_time, start_msg_id)
                 )
                 if update.message:
                     await conn.execute(
@@ -301,7 +374,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_data = {
         "user_id": user.id,
         "chat_id": chat.id,
-        "message_id": sent_message.message_id
+        "message_id": sent_message.message_id,
+        "start_message_id": start_msg_id
     }
     logger.info("Unlock timer started.")
     context.job_queue.run_once(unlock_task, current_delay, data=job_data, name=f"unlock_{user.id}_{chat.id}")
@@ -400,17 +474,18 @@ async def recover_jobs(application):
     
     # 1. Recover unlock active_jobs
     async with get_db() as conn:
-        async with conn.execute("SELECT user_id, chat_id, message_id, unlock_time FROM active_jobs") as cursor:
+        async with conn.execute("SELECT user_id, chat_id, message_id, unlock_time, start_message_id FROM active_jobs") as cursor:
             rows = await cursor.fetchall()
         
     for row in rows:
-        user_id, chat_id, message_id, unlock_time = row
+        user_id, chat_id, message_id, unlock_time, start_message_id = row
         remaining = unlock_time - now
         
         job_data = {
             "user_id": user_id,
             "chat_id": chat_id,
-            "message_id": message_id
+            "message_id": message_id,
+            "start_message_id": start_message_id
         }
         
         if remaining <= 0:
@@ -479,6 +554,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(forward_button_callback, pattern="^forward_click$"))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("setunprotected", set_unprotected))
     application.add_handler(CommandHandler("settimer", set_timer))
