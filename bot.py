@@ -19,7 +19,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 7.5))
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
-FORWARD_LINK = os.getenv("FORWARD_LINK", "https://t.me/sae_plays/3")
+FORWARD_LINK = os.getenv("FORWARD_LINK", "https://t.me/sae_plays/15")
 
 # Configure Logging
 logging.basicConfig(
