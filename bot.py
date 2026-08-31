@@ -221,15 +221,11 @@ async def forward_button_callback(update: Update, context: ContextTypes.DEFAULT_
 
     logger.info(f"User {user_id} clicked forward button in chat {chat_id}")
 
-    # Answer query to open the target link in browser/telegram app
+    # Answer callback query so button loading animation stops cleanly
     try:
-        await query.answer(url=FORWARD_LINK)
+        await query.answer(text="Unlocking message...")
     except Exception as e:
-        logger.warning(f"Could not answer callback query with URL: {e}")
-        try:
-            await query.answer()
-        except Exception:
-            pass
+        logger.warning(f"Could not answer callback query: {e}")
 
     # Retrieve and remove active job info for this user
     start_message_id = None
