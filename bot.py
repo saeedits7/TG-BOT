@@ -444,9 +444,9 @@ async def health_check(request):
     return web.Response(text="Bot is running!")
 
 async def start_webserver():
-    """Starts a dummy web server so Render doesn't shut down the bot."""
+    """Starts a dummy web server so Render detects open port instantly."""
     app = web.Application()
-    app.router.add_get('/', health_check)
+    app.router.add_route('*', '/{tail:.*}', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 10000))
@@ -456,10 +456,10 @@ async def start_webserver():
 
 async def post_init(application):
     """Run this after the bot initializes."""
+    await start_webserver()  # Bind port IMMEDIATELY for Render port scanner
     await init_db()
     await load_config_cache()
     await recover_jobs(application)
-    await start_webserver()
 
 def main():
     if not BOT_TOKEN:
