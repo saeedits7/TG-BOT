@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-UNLOCK_DELAY = int(os.getenv("UNLOCK_DELAY", 10))
+UNLOCK_DELAY = float(os.getenv("UNLOCK_DELAY", 10))
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8984398175))
 
 # Configure Logging
@@ -142,11 +142,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with conn.execute("SELECT value FROM config WHERE key = 'delay'") as cursor:
             row = await cursor.fetchone()
         
-    if row and row[0].isdigit():
-        current_delay = int(row[0])
+    if row:
+        try:
+            current_delay = float(row[0])
+        except ValueError:
+            current_delay = UNLOCK_DELAY
     else:
         current_delay = UNLOCK_DELAY
-        
+
     unlock_time = now + current_delay
 
     async with aiosqlite.connect(DB_FILE) as conn:
@@ -202,15 +205,17 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id != ADMIN_ID:
         return
     text = update.message.text.partition(' ')[2]
-    if not text or not text.isdigit():
-        await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 15")
+    try:
+        delay = float(text)
+    except ValueError:
+        await update.message.reply_text("Please provide a valid number of seconds. Example:\n/settimer 7.5 or /settimer 10")
         return
     
-    delay = int(text)
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('delay', ?)", (str(delay),))
         await conn.commit()
     await update.message.reply_text(f"Timer successfully updated to {delay} seconds!")
+
 
 async def recover_jobs(application):
     """Recover pending jobs from the database after a restart."""
