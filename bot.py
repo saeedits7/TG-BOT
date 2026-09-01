@@ -342,6 +342,48 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
         logger.error(f"Failed to update broadcast status message: {e}")
 
 
+async def purge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to purge past broadcast/messages across all registered users (ID range 1-100)."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    status_msg = await update.message.reply_text("🧹 *Purge operation initiated...*\nDeleting messages across all registered user chats in parallel...", parse_mode="Markdown")
+
+    # Fetch all user IDs from SQLite DB
+    async with get_db() as conn:
+        async with conn.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+
+    user_ids = {row[0] for row in rows}
+    user_ids.add(ADMIN_ID)
+
+    if not user_ids:
+        await status_msg.edit_text("No users found in database to purge.")
+        return
+
+    semaphore = asyncio.Semaphore(20)
+
+    async def delete_single(uid, msg_id):
+        async with semaphore:
+            try:
+                await context.bot.delete_message(chat_id=uid, message_id=msg_id)
+                return 1
+            except TelegramError:
+                return 0
+
+    tasks = [delete_single(uid, msg_id) for uid in user_ids for msg_id in range(1, 100)]
+    results = await asyncio.gather(*tasks)
+    total_deleted = sum(results)
+
+    await status_msg.edit_text(
+        f"✅ *Purge Completed!*\n\n"
+        f"👥 *Target Chats:* {len(user_ids)}\n"
+        f"🗑 *Total Messages Deleted:* {total_deleted}",
+        parse_mode="Markdown"
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to view bot usage statistics."""
     user = update.effective_user
@@ -365,6 +407,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔒 *Protected Messages Delivered:* {protected_sent}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 
 async def recover_jobs(application):
@@ -432,9 +475,11 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setprotected", set_protected))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("purge", purge_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_broadcast_message))
+
 
     application.run_polling()
 
